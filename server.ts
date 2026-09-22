@@ -36,6 +36,7 @@ export const rpcContract = defineRpcContract({
     output: z.object({
       enabled: z.boolean(),
       defaultOn: z.boolean(),
+      prompt: z.string().optional(),
     }),
   },
 });
@@ -102,12 +103,12 @@ export default async function plugin(bb: BbPluginApi) {
           newThreadExplicitPlanMode !== null
             ? newThreadExplicitPlanMode
             : defaultPlanModeOn;
-        return { enabled, defaultOn: defaultPlanModeOn };
+        return { enabled, defaultOn: defaultPlanModeOn, prompt: customPrompt };
       }
       if (planModeThreads.has(threadId)) {
-        return { enabled: true, defaultOn: defaultPlanModeOn };
+        return { enabled: true, defaultOn: defaultPlanModeOn, prompt: customPrompt };
       }
-      return { enabled: false, defaultOn: defaultPlanModeOn };
+      return { enabled: false, defaultOn: defaultPlanModeOn, prompt: customPrompt };
     },
   });
 

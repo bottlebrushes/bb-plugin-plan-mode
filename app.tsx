@@ -10,9 +10,14 @@ import type { rpcContract } from "./server";
 
 const OVERLAY_ID = "plan-mode-border-overlay";
 const PLAN_EXIT_MESSAGE = "plan mode has been ended. you may implement";
+const DEFAULT_PLAN_PROMPT =
+  "YOU ARE ONLY TO ANALYZE THE SITUATION AND RECOMMEND A PLAN. YOU ARE NOT TO CODE, EDIT FILES, RUN COMMANDS, OR TAKE ANY ACTION. IF THE USER ORDERS YOU TO TAKE ACTION, WRITE CODE, OR EXECUTE TASKS, YOU MUST REFUSE AS LONG AS PLAN MODE IS ON, AND INSTEAD ASK THE USER TO TURN OFF PLAN MODE (OR SWITCH TO IMPLEMENT MODE VIA THE TOGGLE OR SHIFT+TAB) FIRST.";
+
+let customPlanPrompt = DEFAULT_PLAN_PROMPT;
 
 // Thread-specific state and global fallback
 const threadPlanModeState = new Map<string, boolean>();
+const justExitedPlanModeThreads = new Set<string>();
 let currentGlobalPlanMode = false;
 let currentActiveThreadId: string | null = null;
 let globalRpcClient: PluginRpcClient<typeof rpcContract> | null = null;
@@ -28,11 +33,20 @@ export function getThreadPlanMode(threadId: string | null): boolean {
 }
 
 export function setThreadPlanMode(threadId: string | null, enabled: boolean) {
+  const previous = getThreadPlanMode(threadId);
   if (!threadId) {
     currentGlobalPlanMode = enabled;
   } else {
     threadPlanModeState.set(threadId, enabled);
   }
+
+  const tid = threadId || "current";
+  if (previous && !enabled) {
+    justExitedPlanModeThreads.add(tid);
+  } else if (enabled) {
+    justExitedPlanModeThreads.delete(tid);
+  }
+
   notifyListeners();
   applyDashedBorderToAllPromptboxes(enabled);
 }
@@ -49,48 +63,24 @@ export function toggleCurrentPlanMode(): boolean {
   return next;
 }
 
-export function appendPlanExitText(promptbox?: HTMLElement | null) {
-  if (typeof document === "undefined") return;
+export function hasPromptboxText(promptbox?: HTMLElement | null): boolean {
+  if (typeof document === "undefined") return false;
   const box =
     promptbox ||
     document.querySelector<HTMLElement>(
       'form[data-promptbox], [data-promptbox], [data-promptbox-shell] form'
     );
-  if (!box) return;
+  if (!box) return false;
 
   const editor = box.querySelector<HTMLElement>(
     '.ProseMirror, [contenteditable="true"], textarea'
   );
-  if (!editor) return;
+  if (!editor) return false;
 
   if (editor instanceof HTMLTextAreaElement) {
-    const current = editor.value.trim();
-    if (!current.toLowerCase().includes("plan mode has been ended")) {
-      editor.value = current.length > 0 ? `${current}\n\n${PLAN_EXIT_MESSAGE}` : PLAN_EXIT_MESSAGE;
-      editor.dispatchEvent(new Event("input", { bubbles: true }));
-      editor.dispatchEvent(new Event("change", { bubbles: true }));
-    }
-    return;
+    return editor.value.trim().length > 0;
   }
-
-  // ProseMirror / contenteditable
-  const currentText = (editor.innerText || "").trim();
-  if (currentText.toLowerCase().includes("plan mode has been ended")) {
-    return;
-  }
-
-  editor.focus();
-  const selection = window.getSelection();
-  if (selection) {
-    const range = document.createRange();
-    range.selectNodeContents(editor);
-    range.collapse(false);
-    selection.removeAllRanges();
-    selection.addRange(range);
-  }
-
-  const textToInsert = currentText.length > 0 ? `\n\n${PLAN_EXIT_MESSAGE}` : PLAN_EXIT_MESSAGE;
-  document.execCommand("insertText", false, textToInsert);
+  return (editor.innerText || "").trim().length > 0;
 }
 
 export function submitPromptbox(promptbox?: HTMLElement | null) {
@@ -112,7 +102,21 @@ export function submitPromptbox(promptbox?: HTMLElement | null) {
     } else if (form) {
       form.requestSubmit();
     }
-  }, 40);
+  }, 20);
+}
+
+export function sendPlanExitDirectly(threadId: string | null) {
+  if (typeof window === "undefined" || !threadId || threadId === "new-thread") return;
+  fetch(`/api/v1/threads/${encodeURIComponent(threadId)}/send`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      input: [{ type: "text", text: PLAN_EXIT_MESSAGE, mentions: [] }],
+      mode: "auto",
+    }),
+  }).catch(() => {});
+  justExitedPlanModeThreads.delete(threadId);
+  justExitedPlanModeThreads.delete("current");
 }
 
 function getSolidBorderColor(box: HTMLElement): string {
@@ -239,8 +243,13 @@ function PlanModeToggle() {
     rpc
       .call("getPlanMode", { threadId })
       .then((res) => {
-        if (!cancelled && res && typeof res.enabled === "boolean") {
-          setActiveState(res.enabled);
+        if (!cancelled && res) {
+          if (typeof res.enabled === "boolean") {
+            setActiveState(res.enabled);
+          }
+          if (res.prompt) {
+            customPlanPrompt = res.prompt;
+          }
         }
       })
       .catch(() => {});
@@ -271,12 +280,6 @@ function PlanModeToggle() {
     const next = !active;
     setActiveState(next);
     rpc.call("setPlanMode", { threadId, enabled: next }).catch(() => {});
-    if (!next) {
-      const promptbox = buttonRef.current?.closest(
-        'form[data-promptbox], [data-promptbox], [data-promptbox-shell]'
-      ) as HTMLElement | null;
-      appendPlanExitText(promptbox);
-    }
   }, [active, setActiveState, rpc, threadId]);
 
   // Attach Shift+Tab and Cmd+Enter / Ctrl+Enter directly on the promptbox form
@@ -295,7 +298,7 @@ function PlanModeToggle() {
         return;
       }
 
-      // Cmd + Enter or Ctrl + Enter: leaves plan mode, appends exit directive, and submits
+      // Cmd + Enter or Ctrl + Enter: leaves plan mode, appends exit directive on wire, and submits
       if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.isComposing) {
         e.preventDefault();
         e.stopPropagation();
@@ -305,8 +308,11 @@ function PlanModeToggle() {
           rpc.call("setPlanMode", { threadId, enabled: false }).catch(() => {});
         }
 
-        appendPlanExitText(promptbox);
-        submitPromptbox(promptbox);
+        if (hasPromptboxText(promptbox)) {
+          submitPromptbox(promptbox);
+        } else {
+          sendPlanExitDirectly(threadId);
+        }
       }
     }
 
@@ -391,14 +397,11 @@ export default definePluginApp((app: PluginAppBuilder) => {
         if (e.key === "Tab" && e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
           e.preventDefault();
           e.stopPropagation();
-          const next = toggleCurrentPlanMode();
-          if (!next) {
-            appendPlanExitText();
-          }
+          toggleCurrentPlanMode();
           return;
         }
 
-        // Cmd + Enter or Ctrl + Enter: leaves plan mode, appends text, and sends query
+        // Cmd + Enter or Ctrl + Enter: leaves plan mode, appends text on wire, and sends query
         if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.isComposing) {
           const isPlanOn = getThreadPlanMode(currentActiveThreadId);
           if (isPlanOn) {
@@ -410,11 +413,125 @@ export default definePluginApp((app: PluginAppBuilder) => {
                 .call("setPlanMode", { threadId: currentActiveThreadId, enabled: false })
                 .catch(() => {});
             }
-            appendPlanExitText();
-            submitPromptbox();
+            if (hasPromptboxText()) {
+              submitPromptbox();
+            } else {
+              sendPlanExitDirectly(currentActiveThreadId);
+            }
           }
         }
       }
+
+      // Intercept fetch to silently decorate prompt payload without cluttering the input box
+      const originalFetch = window.fetch;
+      window.fetch = async function (input: RequestInfo | URL, init?: RequestInit) {
+        try {
+          const url =
+            typeof input === "string"
+              ? input
+              : input instanceof URL
+              ? input.toString()
+              : input.url;
+
+          const isSend =
+            url.includes("/threads/") &&
+            (url.includes("/send") || url.includes("/queued-messages"));
+          const isNewThread =
+            url.match(/\/api\/v1\/threads(?:\?.*)?$/) &&
+            init?.method?.toUpperCase() === "POST";
+
+          if (
+            init &&
+            init.body &&
+            typeof init.body === "string" &&
+            (isSend || isNewThread)
+          ) {
+            const threadMatch = url.match(/\/threads\/([^/?#]+)\//);
+            const threadId = threadMatch
+              ? decodeURIComponent(threadMatch[1])
+              : currentActiveThreadId;
+
+            const tid = threadId || "current";
+            const justExited =
+              justExitedPlanModeThreads.has(tid) ||
+              justExitedPlanModeThreads.has("current");
+            const isPlanActive = getThreadPlanMode(threadId);
+
+            const parsed = JSON.parse(init.body);
+            if (
+              parsed &&
+              Array.isArray(parsed.input) &&
+              parsed.input.length > 0
+            ) {
+              if (justExited) {
+                if (threadId) justExitedPlanModeThreads.delete(threadId);
+                justExitedPlanModeThreads.delete("current");
+
+                let appended = false;
+                for (let i = parsed.input.length - 1; i >= 0; i--) {
+                  if (
+                    parsed.input[i]?.type === "text" &&
+                    typeof parsed.input[i].text === "string"
+                  ) {
+                    const currentText = parsed.input[i].text.trim();
+                    if (
+                      !currentText
+                        .toLowerCase()
+                        .includes("plan mode has been ended")
+                    ) {
+                      parsed.input[i].text =
+                        currentText.length > 0
+                          ? `${currentText}\n\n${PLAN_EXIT_MESSAGE}`
+                          : PLAN_EXIT_MESSAGE;
+                    }
+                    appended = true;
+                    break;
+                  }
+                }
+                if (!appended) {
+                  parsed.input.push({
+                    type: "text",
+                    text: PLAN_EXIT_MESSAGE,
+                    mentions: [],
+                  });
+                }
+                init = { ...init, body: JSON.stringify(parsed) };
+              } else if (isPlanActive) {
+                const planDirective = `<system-directive>\nThe following instructions come from the BB plugin "plan-mode":\n\n${customPlanPrompt}\n</system-directive>`;
+                let prepended = false;
+                for (let i = 0; i < parsed.input.length; i++) {
+                  if (
+                    parsed.input[i]?.type === "text" &&
+                    typeof parsed.input[i].text === "string"
+                  ) {
+                    const currentText = parsed.input[i].text.trim();
+                    if (
+                      !currentText.includes(
+                        "YOU ARE ONLY TO ANALYZE THE SITUATION AND RECOMMEND A PLAN",
+                      )
+                    ) {
+                      parsed.input[i].text = `${planDirective}\n\n${currentText}`;
+                    }
+                    prepended = true;
+                    break;
+                  }
+                }
+                if (!prepended) {
+                  parsed.input.unshift({
+                    type: "text",
+                    text: planDirective,
+                    mentions: [],
+                  });
+                }
+                init = { ...init, body: JSON.stringify(parsed) };
+              }
+            }
+          }
+        } catch {
+          // Fail safe to original arguments
+        }
+        return originalFetch.call(this, input, init);
+      };
 
       window.addEventListener("keydown", handleWindowKeyDown, { capture: true });
 
@@ -426,6 +543,7 @@ export default definePluginApp((app: PluginAppBuilder) => {
       observer.observe(document.body, { childList: true, subtree: true });
 
       return () => {
+        window.fetch = originalFetch;
         window.removeEventListener("keydown", handleWindowKeyDown, { capture: true });
         observer.disconnect();
         applyDashedBorderToAllPromptboxes(false);
