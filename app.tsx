@@ -9,6 +9,7 @@ import {
 import type { rpcContract } from "./server";
 
 const OVERLAY_ID = "plan-mode-border-overlay";
+const PLAN_EXIT_MESSAGE = "plan mode has been ended. you may implement";
 
 // Thread-specific state and global fallback
 const threadPlanModeState = new Map<string, boolean>();
@@ -46,6 +47,72 @@ export function toggleCurrentPlanMode(): boolean {
       .catch(() => {});
   }
   return next;
+}
+
+export function appendPlanExitText(promptbox?: HTMLElement | null) {
+  if (typeof document === "undefined") return;
+  const box =
+    promptbox ||
+    document.querySelector<HTMLElement>(
+      'form[data-promptbox], [data-promptbox], [data-promptbox-shell] form'
+    );
+  if (!box) return;
+
+  const editor = box.querySelector<HTMLElement>(
+    '.ProseMirror, [contenteditable="true"], textarea'
+  );
+  if (!editor) return;
+
+  if (editor instanceof HTMLTextAreaElement) {
+    const current = editor.value.trim();
+    if (!current.toLowerCase().includes("plan mode has been ended")) {
+      editor.value = current.length > 0 ? `${current}\n\n${PLAN_EXIT_MESSAGE}` : PLAN_EXIT_MESSAGE;
+      editor.dispatchEvent(new Event("input", { bubbles: true }));
+      editor.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    return;
+  }
+
+  // ProseMirror / contenteditable
+  const currentText = (editor.innerText || "").trim();
+  if (currentText.toLowerCase().includes("plan mode has been ended")) {
+    return;
+  }
+
+  editor.focus();
+  const selection = window.getSelection();
+  if (selection) {
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+
+  const textToInsert = currentText.length > 0 ? `\n\n${PLAN_EXIT_MESSAGE}` : PLAN_EXIT_MESSAGE;
+  document.execCommand("insertText", false, textToInsert);
+}
+
+export function submitPromptbox(promptbox?: HTMLElement | null) {
+  if (typeof document === "undefined") return;
+  const box =
+    promptbox ||
+    document.querySelector<HTMLElement>(
+      'form[data-promptbox], [data-promptbox], [data-promptbox-shell] form'
+    );
+  if (!box) return;
+
+  setTimeout(() => {
+    const form = (box instanceof HTMLFormElement ? box : box.closest("form")) as HTMLFormElement | null;
+    const submitBtn = form?.querySelector<HTMLButtonElement>(
+      'button[type="submit"], button[aria-label*="Submit"], button[title*="Submit"]'
+    );
+    if (submitBtn && !submitBtn.disabled) {
+      submitBtn.click();
+    } else if (form) {
+      form.requestSubmit();
+    }
+  }, 40);
 }
 
 function getSolidBorderColor(box: HTMLElement): string {
@@ -90,12 +157,9 @@ function updatePromptboxDashedOverlay(box: HTMLElement, enabled: boolean) {
       rect.setAttribute("rx", "11.5");
       rect.setAttribute("ry", "11.5");
       rect.setAttribute("fill", "none");
-      // Exactly 1px thick matching the native border
       rect.setAttribute("stroke-width", "1");
-      // Longer dashes: 14px dash, 8px gap
       rect.setAttribute("stroke-dasharray", "14 8");
       rect.setAttribute("stroke-linecap", "round");
-      // Exact color of the solid line
       rect.setAttribute("stroke", borderColor);
       rect.style.stroke = borderColor;
 
@@ -207,9 +271,15 @@ function PlanModeToggle() {
     const next = !active;
     setActiveState(next);
     rpc.call("setPlanMode", { threadId, enabled: next }).catch(() => {});
+    if (!next) {
+      const promptbox = buttonRef.current?.closest(
+        'form[data-promptbox], [data-promptbox], [data-promptbox-shell]'
+      ) as HTMLElement | null;
+      appendPlanExitText(promptbox);
+    }
   }, [active, setActiveState, rpc, threadId]);
 
-  // Attach Shift+Tab directly on the promptbox form
+  // Attach Shift+Tab and Cmd+Enter / Ctrl+Enter directly on the promptbox form
   useEffect(() => {
     const promptbox = buttonRef.current?.closest(
       'form[data-promptbox], [data-promptbox]'
@@ -225,12 +295,18 @@ function PlanModeToggle() {
         return;
       }
 
-      // Cmd + Enter: leaves plan mode
+      // Cmd + Enter or Ctrl + Enter: leaves plan mode, appends exit directive, and submits
       if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.isComposing) {
+        e.preventDefault();
+        e.stopPropagation();
+
         if (active) {
           setActiveState(false);
           rpc.call("setPlanMode", { threadId, enabled: false }).catch(() => {});
         }
+
+        appendPlanExitText(promptbox);
+        submitPromptbox(promptbox);
       }
     }
 
@@ -256,13 +332,13 @@ function PlanModeToggle() {
       }
       title={
         active
-          ? "Plan mode active (Shift+Tab to switch to Implement, Cmd+Enter to leave)"
+          ? "Plan mode active (Shift+Tab or Ctrl+Enter to exit and implement)"
           : "Implement mode (Shift+Tab to switch to Plan)"
       }
       className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg p-0 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground select-none"
     >
       {active ? (
-        /* Plan Icon: Clipboard with checkmark (icon only, neutral color) */
+        /* Plan Icon: Clipboard with checkmark */
         <svg
           className="size-4"
           viewBox="0 0 24 24"
@@ -277,7 +353,7 @@ function PlanModeToggle() {
           <path d="m9 14 2 2 4-4" />
         </svg>
       ) : (
-        /* Implement Icon: Code brackets </> (icon only, neutral color) */
+        /* Implement Icon: Code brackets </> */
         <svg
           className="size-4"
           viewBox="0 0 24 24"
@@ -312,41 +388,48 @@ export default definePluginApp((app: PluginAppBuilder) => {
     mount({ signal }) {
       function handleWindowKeyDown(e: KeyboardEvent) {
         // Shift + Tab: toggle between Implement and Plan
-      if (e.key === "Tab" && e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
-        e.preventDefault();
-        e.stopPropagation();
-        toggleCurrentPlanMode();
-        return;
-      }
+        if (e.key === "Tab" && e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+          e.preventDefault();
+          e.stopPropagation();
+          const next = toggleCurrentPlanMode();
+          if (!next) {
+            appendPlanExitText();
+          }
+          return;
+        }
 
-      // Cmd + Enter: leaves plan mode
-      if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.isComposing) {
-        if (getThreadPlanMode(currentActiveThreadId)) {
-          setThreadPlanMode(currentActiveThreadId, false);
-          if (globalRpcClient) {
-            globalRpcClient
-              .call("setPlanMode", { threadId: currentActiveThreadId, enabled: false })
-              .catch(() => {});
+        // Cmd + Enter or Ctrl + Enter: leaves plan mode, appends text, and sends query
+        if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.isComposing) {
+          const isPlanOn = getThreadPlanMode(currentActiveThreadId);
+          if (isPlanOn) {
+            e.preventDefault();
+            e.stopPropagation();
+            setThreadPlanMode(currentActiveThreadId, false);
+            if (globalRpcClient) {
+              globalRpcClient
+                .call("setPlanMode", { threadId: currentActiveThreadId, enabled: false })
+                .catch(() => {});
+            }
+            appendPlanExitText();
+            submitPromptbox();
           }
         }
       }
-    }
 
-    window.addEventListener("keydown", handleWindowKeyDown, { capture: true });
+      window.addEventListener("keydown", handleWindowKeyDown, { capture: true });
 
-    // Observe DOM additions to ensure promptbox gets dashed overlay if plan mode is active
-    const observer = new MutationObserver(() => {
-      if (document.body.classList.contains("bb-plan-mode-active")) {
-        applyDashedBorderToAllPromptboxes(true);
-      }
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
+      const observer = new MutationObserver(() => {
+        if (document.body.classList.contains("bb-plan-mode-active")) {
+          applyDashedBorderToAllPromptboxes(true);
+        }
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
 
-    return () => {
-      window.removeEventListener("keydown", handleWindowKeyDown, { capture: true });
-      observer.disconnect();
-      applyDashedBorderToAllPromptboxes(false);
-    };
-  },
+      return () => {
+        window.removeEventListener("keydown", handleWindowKeyDown, { capture: true });
+        observer.disconnect();
+        applyDashedBorderToAllPromptboxes(false);
+      };
+    },
   });
 });

@@ -4,6 +4,9 @@ import { z } from "zod";
 const DEFAULT_PROMPT =
   "YOU ARE ONLY TO ANALYZE THE SITUATION AND RECOMMEND A PLAN. YOU ARE NOT TO CODE, EDIT FILES, RUN COMMANDS, OR TAKE ANY ACTION. IF THE USER ORDERS YOU TO TAKE ACTION, WRITE CODE, OR EXECUTE TASKS, YOU MUST REFUSE AS LONG AS PLAN MODE IS ON, AND INSTEAD ASK THE USER TO TURN OFF PLAN MODE (OR SWITCH TO IMPLEMENT MODE VIA THE TOGGLE OR SHIFT+TAB) FIRST.";
 
+const EXIT_PLAN_MODE_PROMPT =
+  "PLAN MODE HAS BEEN ENDED. YOU ARE NOW IN IMPLEMENT MODE. PROCEED WITH IMPLEMENTATION, WRITE CODE, EDIT FILES, AND EXECUTE TASKS DIRECTLY WITHOUT GATING ON MODE SWITCHES.";
+
 const OLD_DEFAULT_PROMPT =
   "YOU ARE ONLY TO ANALYZE THE SITUATION AND RECOMMEND A PLAN, YOU ARE NOT TO CODE OR TAKE ANY ACTION";
 
@@ -12,6 +15,7 @@ let defaultPlanModeOn = false;
 
 // Active thread IDs in plan mode
 const planModeThreads = new Set<string>();
+const justExitedPlanModeThreads = new Set<string>();
 let newThreadExplicitPlanMode: boolean | null = null;
 
 export const rpcContract = defineRpcContract({
@@ -83,7 +87,11 @@ export default async function plugin(bb: BbPluginApi) {
         newThreadExplicitPlanMode = enabled;
       } else if (enabled) {
         planModeThreads.add(threadId);
+        justExitedPlanModeThreads.delete(threadId);
       } else {
+        if (planModeThreads.has(threadId)) {
+          justExitedPlanModeThreads.add(threadId);
+        }
         planModeThreads.delete(threadId);
       }
       return { ok: true, enabled };
@@ -116,17 +124,24 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.events.on("thread.archived", ({ thread }) => {
     planModeThreads.delete(thread.id);
+    justExitedPlanModeThreads.delete(thread.id);
   });
 
   bb.events.on("thread.deleted", ({ thread }) => {
     planModeThreads.delete(thread.id);
+    justExitedPlanModeThreads.delete(thread.id);
   });
 
-  // Inject instructions ONLY when thread is actively in Plan Mode
+  // Inject instructions when thread is actively in Plan Mode or just exited
   bb.agents.contributeInstructions(({ threadId }) => {
-    if (planModeThreads.has(threadId)) {
+    if (threadId && planModeThreads.has(threadId)) {
       bb.log.info(`Injecting Plan Mode directive for thread: ${threadId}`);
       return customPrompt.trim();
+    }
+    if (threadId && justExitedPlanModeThreads.has(threadId)) {
+      bb.log.info(`Injecting Plan Mode Exit directive for thread: ${threadId}`);
+      justExitedPlanModeThreads.delete(threadId);
+      return EXIT_PLAN_MODE_PROMPT;
     }
     return null;
   });
