@@ -2,6 +2,9 @@
   "name": "bb-plugin-plan-mode",
   "version": "0.1.1",
   "type": "module",
+  "scripts": {
+    "test": "vitest run"
+  },
   "engines": {
     "bb": ">=0.42",
     "bbPluginSdk": ">=0.4.47"
@@ -47,7 +50,12 @@
     "clsx": "^2.1.1",
     "sonner": "^1.7.4",
     "tailwind-merge": "^3.4.0",
-    "vaul": "^1.1.2"
+    "vaul": "^1.1.2",
+    "@testing-library/react": "^16.3.3",
+    "jsdom": "^26.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "vitest": "^5.0.4"
   },
   "license": "MIT",
   "author": "Daniel Walker",
